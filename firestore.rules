@@ -1,0 +1,17 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // PIN-Einstellungen: jeder kann lesen, aber nur schreiben wenn noch nichts existiert
+    match /config/settings {
+      allow read: if true;
+      allow create: if true;
+      allow update, delete: if false;
+    }
+
+    // Kinderliste: jeder Benutzer kann lesen und schreiben
+    match /children/{childId} {
+      allow read, write: if true;
+    }
+  }
+}
