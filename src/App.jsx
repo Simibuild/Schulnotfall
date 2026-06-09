@@ -408,9 +408,9 @@ export default function App() {
   };
   const stillExpected = counts.offen + counts.da;
 
-  // Filter anwenden für Listenanzeige
+  // Filter anwenden für Listenanzeige (Status der Kinder bleibt unverändert)
   const filteredChildren = (() => {
-    if (filter === 'expected') return children.filter(c => c.status === 'offen' || c.status === 'da');
+    if (filter === 'da') return children.filter(c => c.status === 'da');
     if (filter === 'abgeholt') return children.filter(c => c.status === 'abgeholt');
     if (filter === 'entschuldigt') return children.filter(c => c.status === 'entschuldigt');
     return children;
@@ -627,16 +627,19 @@ export default function App() {
 
       <div className="stats-grid">
         <button
-          className={`stat-card stat-must ${filter === 'expected' ? 'stat-active' : ''}`}
-          onClick={() => setFilter(filter === 'expected' ? null : 'expected')}
+          className={`stat-card stat-must ${filter === null ? 'stat-active' : ''}`}
+          onClick={() => setFilter(null)}
         >
-          <div className="stat-number">{stillExpected}</div>
-          <div className="stat-label">müssen da sein</div>
+          <div className="stat-number">{counts.total}</div>
+          <div className="stat-label">Alle</div>
         </button>
-        <div className="stat-card stat-da">
+        <button
+          className={`stat-card stat-da ${filter === 'da' ? 'stat-active' : ''}`}
+          onClick={() => setFilter(filter === 'da' ? null : 'da')}
+        >
           <div className="stat-number">{counts.da}</div>
           <div className="stat-label">Da ✓</div>
-        </div>
+        </button>
         <button
           className={`stat-card stat-abgeholt ${filter === 'abgeholt' ? 'stat-active' : ''}`}
           onClick={() => setFilter(filter === 'abgeholt' ? null : 'abgeholt')}
@@ -655,12 +658,12 @@ export default function App() {
 
       {filter && (
         <div className="filter-bar">
-          Filter aktiv: <strong>
-            {filter === 'expected' && 'Müssen da sein'}
+          Filter: <strong>
+            {filter === 'da' && 'Da'}
             {filter === 'abgeholt' && 'Abgeholt'}
             {filter === 'entschuldigt' && 'Entschuldigt'}
           </strong>
-          <button className="btn-mini" onClick={() => setFilter(null)}>✕ Filter aufheben</button>
+          <button className="btn-mini" onClick={() => setFilter(null)}>✕ Alle anzeigen</button>
         </div>
       )}
 
