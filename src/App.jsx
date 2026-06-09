@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect } from 'react';
 import { db } from './firebase';
 import {
   collection,
@@ -12,13 +12,12 @@ import {
   setDoc,
   query,
   where,
-  orderBy,
   serverTimestamp,
   writeBatch,
 } from 'firebase/firestore';
 
 // ──────────────────────────────────────────────────────────────────────────
-// Status-Konfiguration
+// Status- und Klassen-Konfiguration
 // ──────────────────────────────────────────────────────────────────────────
 const STATUS_CONFIG = {
   offen:       { label: 'Offen',        color: '#6b7280' },
@@ -26,7 +25,10 @@ const STATUS_CONFIG = {
   abgeholt:    { label: 'Abgeholt',     color: '#b45309' },
   entschuldigt:{ label: 'Entschuldigt', color: '#7c3aed' },
 };
-const STATUS_ORDER = { offen: 0, da: 1, abgeholt: 2, entschuldigt: 3 };
+
+// Feste Reihenfolge der Klassen
+const CLASSES = ['1a', '1b', '2a', '2b', '3a', '3b', '4a', '4b'];
+const DEFAULT_CLASS = '1a';
 
 // ──────────────────────────────────────────────────────────────────────────
 // Hilfsfunktionen für Datum
@@ -41,11 +43,28 @@ const formatDate = (key) => {
 };
 const daysBetween = (a, b) => Math.round((new Date(b) - new Date(a)) / 86400000);
 
+// Stabile Sortierung: nach Klasse, dann alphabetisch — NIE nach Status
 function sortChildren(list) {
   return [...list].sort((a, b) => {
-    const diff = (STATUS_ORDER[a.status] ?? 0) - (STATUS_ORDER[b.status] ?? 0);
-    return diff !== 0 ? diff : a.name.localeCompare(b.name, 'de');
+    const ka = CLASSES.indexOf(a.klasse || DEFAULT_CLASS);
+    const kb = CLASSES.indexOf(b.klasse || DEFAULT_CLASS);
+    const ia = ka === -1 ? 999 : ka;
+    const ib = kb === -1 ? 999 : kb;
+    if (ia !== ib) return ia - ib;
+    return (a.name || '').localeCompare(b.name || '', 'de');
   });
+}
+
+// CSV/Text-Parser: erkennt "1a Max Müller" / "1a;Max Müller" / "1a,Max Müller" / nur "Max Müller"
+function parseImportLine(line) {
+  const trimmed = line.trim();
+  if (!trimmed) return null;
+  // Versuche Klassen-Prefix zu erkennen
+  const m = trimmed.match(/^([1-4][ab])\s*[;,\s]\s*(.+)$/i);
+  if (m) {
+    return { klasse: m[1].toLowerCase(), name: m[2].trim() };
+  }
+  return { klasse: DEFAULT_CLASS, name: trimmed };
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -55,8 +74,9 @@ export default function App() {
   const [userName, setUserName] = useState('');
   const [pinError, setPinError] = useState('');
   const [children, setChildren] = useState([]);
-  const [view, setView] = useState('list'); // list | emergency | calendar | day | settings
+  const [view, setView] = useState('list'); // list | emergency | calendar | day
   const [newName, setNewName] = useState('');
+  const [newClass, setNewClass] = useState(DEFAULT_CLASS);
   const [showAdd, setShowAdd] = useState(false);
   const [showImport, setShowImport] = useState(false);
   const [importText, setImportText] = useState('');
@@ -71,6 +91,8 @@ export default function App() {
     return { year: d.getFullYear(), month: d.getMonth() };
   });
   const [archivedDays, setArchivedDays] = useState([]);
+  const [filter, setFilter] = useState(null); // null | 'expected' | 'abgeholt' | 'entschuldigt'
+  const [showEmergencyReset, setShowEmergencyReset] = useState(false);
 
   // ── Initial check ────────────────────────────────────────────────────
   useEffect(() => {
@@ -118,9 +140,7 @@ export default function App() {
   }, [screen]);
 
   // ──────────────────────────────────────────────────────────────────────
-  // Tages-Reset: prüft beim Öffnen, ob ein neuer Tag begonnen hat.
-  // Wenn ja: archiviert gestrigen Stand + Log, setzt alle auf "offen",
-  // löscht Daten älter als 30 Tage.
+  // Tages-Reset
   // ──────────────────────────────────────────────────────────────────────
   async function runDailyMaintenance() {
     const meta = await getDoc(doc(db, 'config', 'meta'));
@@ -128,11 +148,11 @@ export default function App() {
     const today = todayKey();
 
     if (lastDay && lastDay !== today) {
-      // 1. Snapshot des vergangenen Tages erstellen
       const childrenSnap = await getDocs(collection(db, 'children'));
       const snapshot = childrenSnap.docs.map(d => ({
         id: d.id,
         name: d.data().name,
+        klasse: d.data().klasse || DEFAULT_CLASS,
         status: d.data().status,
       }));
       const logSnap = await getDocs(
@@ -147,22 +167,21 @@ export default function App() {
         savedAt: serverTimestamp(),
       });
 
-      // 2. Alle auf "offen" zurücksetzen
+      // Status zurücksetzen UND emergencySafe zurücksetzen
       const batch = writeBatch(db);
       childrenSnap.docs.forEach(d => {
-        if (d.data().status !== 'offen') {
-          batch.update(d.ref, { status: 'offen' });
-        }
+        const updates = {};
+        if (d.data().status !== 'offen') updates.status = 'offen';
+        if (d.data().emergencySafe) updates.emergencySafe = false;
+        if (Object.keys(updates).length > 0) batch.update(d.ref, updates);
       });
       await batch.commit();
 
-      // 3. Alte Log-Einträge des letzten Tages löschen (sind jetzt im Archiv)
       const oldLogBatch = writeBatch(db);
       logSnap.docs.forEach(d => oldLogBatch.delete(d.ref));
       await oldLogBatch.commit();
     }
 
-    // 4. Archive älter als 30 Tage löschen
     const archives = await getDocs(collection(db, 'archive'));
     const oldBatch = writeBatch(db);
     let hasOld = false;
@@ -174,12 +193,9 @@ export default function App() {
     });
     if (hasOld) await oldBatch.commit();
 
-    // 5. lastActiveDay aktualisieren
     await setDoc(doc(db, 'config', 'meta'), { lastActiveDay: today }, { merge: true });
   }
 
-  // ──────────────────────────────────────────────────────────────────────
-  // Log-Eintrag schreiben
   // ──────────────────────────────────────────────────────────────────────
   async function writeLog(action, childName, fromStatus, toStatus) {
     await addDoc(collection(db, 'log'), {
@@ -195,14 +211,8 @@ export default function App() {
 
   // ── Auth ─────────────────────────────────────────────────────────────
   const handleSetupPin = async () => {
-    if (pin.trim().length < 4) {
-      setPinError('PIN muss mindestens 4 Zeichen haben');
-      return;
-    }
-    if (!userName.trim()) {
-      setPinError('Bitte deinen Namen eingeben');
-      return;
-    }
+    if (pin.trim().length < 4) { setPinError('PIN muss mindestens 4 Zeichen haben'); return; }
+    if (!userName.trim()) { setPinError('Bitte deinen Namen eingeben'); return; }
     await setDoc(doc(db, 'config', 'settings'), { pin: pin.trim() });
     localStorage.setItem('schulnotfall_pin', pin.trim());
     localStorage.setItem('schulnotfall_user', userName.trim());
@@ -215,15 +225,8 @@ export default function App() {
     try {
       const configDoc = await getDoc(doc(db, 'config', 'settings'));
       const stored = configDoc.data()?.pin;
-      if (pin.trim() !== stored) {
-        setPinError('Falscher PIN');
-        setPin('');
-        return;
-      }
-      if (!userName.trim()) {
-        setPinError('Bitte deinen Namen eingeben');
-        return;
-      }
+      if (pin.trim() !== stored) { setPinError('Falscher PIN'); setPin(''); return; }
+      if (!userName.trim()) { setPinError('Bitte deinen Namen eingeben'); return; }
       localStorage.setItem('schulnotfall_pin', pin.trim());
       localStorage.setItem('schulnotfall_user', userName.trim());
       await runDailyMaintenance();
@@ -249,11 +252,14 @@ export default function App() {
     if (!name) return;
     await addDoc(collection(db, 'children'), {
       name,
+      klasse: newClass,
       status: 'offen',
+      emergencySafe: false,
       createdAt: serverTimestamp(),
     });
-    await writeLog('add', name, null, null);
+    await writeLog('add', `${newClass} ${name}`, null, null);
     setNewName('');
+    setNewClass(DEFAULT_CLASS);
     setShowAdd(false);
   };
 
@@ -261,6 +267,24 @@ export default function App() {
     if (child.status === status) return;
     await updateDoc(doc(db, 'children', child.id), { status });
     await writeLog('status', child.name, child.status, status);
+  };
+
+  const handleEmergencyToggle = async (child) => {
+    const newSafe = !child.emergencySafe;
+    await updateDoc(doc(db, 'children', child.id), { emergencySafe: newSafe });
+    await writeLog('emergency', child.name, null, newSafe ? 'sicher' : 'gesucht');
+  };
+
+  const handleEmergencyReset = async () => {
+    setBusy(true);
+    const batch = writeBatch(db);
+    children.forEach(c => {
+      if (c.emergencySafe) batch.update(doc(db, 'children', c.id), { emergencySafe: false });
+    });
+    await batch.commit();
+    await writeLog('emergency-reset', '(alle)', null, null);
+    setBusy(false);
+    setShowEmergencyReset(false);
   };
 
   const handleDelete = async () => {
@@ -282,22 +306,36 @@ export default function App() {
     setShowReset(false);
   };
 
-  // ── CSV Import ───────────────────────────────────────────────────────
+  // ── CSV Import (mit Klassen-Erkennung) ────────────────────────────────
   const handleCsvImport = async () => {
-    const names = importText
-      .split(/[\n,;]/)
-      .map(s => s.trim())
-      .filter(s => s.length > 0);
-    if (names.length === 0) return;
+    const lines = importText.split(/\n/);
+    const entries = [];
+    for (const line of lines) {
+      // Erlaube auch mehrere Namen pro Zeile (durch Komma/Semikolon getrennt)
+      // wenn KEIN Klassen-Prefix da ist
+      const sub = line.split(/[;,]/);
+      if (sub.length > 1 && !/^([1-4][ab])/i.test(line.trim())) {
+        for (const s of sub) {
+          const e = parseImportLine(s);
+          if (e) entries.push(e);
+        }
+      } else {
+        const e = parseImportLine(line);
+        if (e) entries.push(e);
+      }
+    }
+    if (entries.length === 0) return;
     setBusy(true);
-    for (const name of names) {
+    for (const entry of entries) {
       await addDoc(collection(db, 'children'), {
-        name,
+        name: entry.name,
+        klasse: entry.klasse,
         status: 'offen',
+        emergencySafe: false,
         createdAt: serverTimestamp(),
       });
     }
-    await writeLog('import', `${names.length} Kinder`, null, null);
+    await writeLog('import', `${entries.length} Kinder`, null, null);
     setImportText('');
     setShowImport(false);
     setBusy(false);
@@ -311,7 +349,7 @@ export default function App() {
     reader.readAsText(file);
   };
 
-  // ── CSV Export (letzte 30 Tage) ──────────────────────────────────────
+  // ── CSV Export ──────────────────────────────────────────────────────
   const handleCsvExport = async () => {
     setBusy(true);
     const archives = await getDocs(collection(db, 'archive'));
@@ -319,16 +357,16 @@ export default function App() {
       .map(d => d.data())
       .sort((a, b) => a.date.localeCompare(b.date));
 
-    let csv = 'Datum;Kind;Status;Uhrzeit;Aktion;Benutzer\n';
+    let csv = 'Datum;Klasse;Kind;Status;Uhrzeit;Aktion;Benutzer\n';
     sorted.forEach(arch => {
       arch.snapshot.forEach(c => {
-        csv += `${formatDate(arch.date)};${c.name};${STATUS_CONFIG[c.status]?.label || c.status};;;\n`;
+        csv += `${formatDate(arch.date)};${c.klasse || ''};${c.name};${STATUS_CONFIG[c.status]?.label || c.status};;;\n`;
       });
       (arch.logs || []).forEach(l => {
         const time = l.timestamp?.toDate
           ? l.timestamp.toDate().toLocaleTimeString('de-DE')
           : '';
-        csv += `${formatDate(arch.date)};${l.childName};;${time};${l.action} ${l.toStatus || ''};${l.user || ''}\n`;
+        csv += `${formatDate(arch.date)};;${l.childName};;${time};${l.action} ${l.toStatus || ''};${l.user || ''}\n`;
       });
     });
 
@@ -342,7 +380,7 @@ export default function App() {
     setBusy(false);
   };
 
-  // ── Kalender: Archive-Liste laden ────────────────────────────────────
+  // ── Kalender ─────────────────────────────────────────────────────────
   useEffect(() => {
     if (view !== 'calendar') return;
     (async () => {
@@ -368,8 +406,21 @@ export default function App() {
     abgeholt:     children.filter(c => c.status === 'abgeholt').length,
     entschuldigt: children.filter(c => c.status === 'entschuldigt').length,
   };
-  // Wer muss noch da sein? = offen + da (entschuldigt zählt nicht, abgeholt ist weg)
   const stillExpected = counts.offen + counts.da;
+
+  // Filter anwenden für Listenanzeige
+  const filteredChildren = (() => {
+    if (filter === 'expected') return children.filter(c => c.status === 'offen' || c.status === 'da');
+    if (filter === 'abgeholt') return children.filter(c => c.status === 'abgeholt');
+    if (filter === 'entschuldigt') return children.filter(c => c.status === 'entschuldigt');
+    return children;
+  })();
+
+  // Nach Klassen gruppieren für Anzeige
+  const groupedChildren = CLASSES.map(klasse => ({
+    klasse,
+    items: filteredChildren.filter(c => (c.klasse || DEFAULT_CLASS) === klasse),
+  })).filter(g => g.items.length > 0);
 
   // ─────────────────────────────────────────────────────────────────────
   // RENDER
@@ -437,8 +488,17 @@ export default function App() {
 
   // ── Notfallmodus ─────────────────────────────────────────────────────
   if (view === 'emergency') {
+    // Erwartete Kinder = die, die heute da sein müssten (offen + da)
     const expected = children.filter(c => c.status === 'offen' || c.status === 'da');
-    const da = children.filter(c => c.status === 'da');
+    const safeList = expected.filter(c => c.emergencySafe);
+    const searchList = expected.filter(c => !c.emergencySafe);
+
+    // Nach Klassen gruppieren
+    const groupBy = (list) => CLASSES.map(k => ({
+      klasse: k,
+      items: list.filter(c => (c.klasse || DEFAULT_CLASS) === k),
+    })).filter(g => g.items.length > 0);
+
     return (
       <div className="emergency">
         <button className="btn-emergency-close" onClick={() => setView('list')}>
@@ -446,40 +506,81 @@ export default function App() {
         </button>
         <div className="emergency-title">NOTFALL</div>
         <div className="emergency-big">
-          <div className="emergency-number">{stillExpected}</div>
+          <div className="emergency-number">{expected.length}</div>
           <div className="emergency-sub">Kinder müssen anwesend sein</div>
         </div>
         <div className="emergency-counters">
           <div className="ec-card ec-green">
-            <div className="ec-num">{counts.da}</div>
+            <div className="ec-num">{safeList.length}</div>
             <div className="ec-lbl">in Sicherheit</div>
           </div>
           <div className="ec-card ec-red">
-            <div className="ec-num">{counts.offen}</div>
+            <div className="ec-num">{searchList.length}</div>
             <div className="ec-lbl">noch zu suchen</div>
           </div>
         </div>
+
+        <button
+          className="btn-emergency-reset"
+          onClick={() => setShowEmergencyReset(true)}
+          disabled={safeList.length === 0}
+        >
+          ↺ Notfall-Übung neu starten
+        </button>
+
         <div className="emergency-lists">
           <div className="emerg-list emerg-red">
-            <h3>NOCH ZU SUCHEN ({counts.offen})</h3>
-            {children.filter(c => c.status === 'offen').map(c => (
-              <button
-                key={c.id}
-                className="emerg-name emerg-name-red"
-                onClick={() => handleStatus(c, 'da')}
-              >
-                {c.name}
-                <span className="emerg-tap">tippen wenn gefunden →</span>
-              </button>
+            <h3>NOCH ZU SUCHEN ({searchList.length})</h3>
+            {groupBy(searchList).map(g => (
+              <div key={g.klasse} className="emerg-class-group">
+                <div className="emerg-class-head">Klasse {g.klasse}</div>
+                {g.items.map(c => (
+                  <button
+                    key={c.id}
+                    className="emerg-name emerg-name-red"
+                    onClick={() => handleEmergencyToggle(c)}
+                  >
+                    {c.name}
+                    <span className="emerg-tap">tippen wenn in Sicherheit →</span>
+                  </button>
+                ))}
+              </div>
             ))}
-            {counts.offen === 0 && <p className="emerg-empty">✓ Alle gefunden</p>}
+            {searchList.length === 0 && <p className="emerg-empty">✓ Alle in Sicherheit</p>}
           </div>
           <div className="emerg-list emerg-green">
-            <h3>IN SICHERHEIT ({counts.da})</h3>
-            {da.map(c => <div key={c.id} className="emerg-name emerg-name-green">{c.name}</div>)}
-            {da.length === 0 && <p className="emerg-empty">Noch keiner</p>}
+            <h3>IN SICHERHEIT ({safeList.length})</h3>
+            {groupBy(safeList).map(g => (
+              <div key={g.klasse} className="emerg-class-group">
+                <div className="emerg-class-head">Klasse {g.klasse}</div>
+                {g.items.map(c => (
+                  <button
+                    key={c.id}
+                    className="emerg-name emerg-name-green"
+                    onClick={() => handleEmergencyToggle(c)}
+                    title="Tippen rückgängig machen"
+                  >
+                    {c.name}
+                  </button>
+                ))}
+              </div>
+            ))}
+            {safeList.length === 0 && <p className="emerg-empty">Noch keiner</p>}
           </div>
         </div>
+
+        {showEmergencyReset && (
+          <Modal onClose={() => setShowEmergencyReset(false)}>
+            <h2>Notfall-Übung neu starten?</h2>
+            <p>Alle Kinder werden wieder als „noch zu suchen" markiert.</p>
+            <div className="modal-actions">
+              <button className="btn-secondary" onClick={() => setShowEmergencyReset(false)}>Abbrechen</button>
+              <button className="btn-warning" onClick={handleEmergencyReset} disabled={busy}>
+                {busy ? '…' : 'Zurücksetzen'}
+              </button>
+            </div>
+          </Modal>
+        )}
       </div>
     );
   }
@@ -497,7 +598,6 @@ export default function App() {
     />;
   }
 
-  // ── Tagesansicht ─────────────────────────────────────────────────────
   if (view === 'day' && dayData) {
     return <DayView
       day={selectedDay}
@@ -521,29 +621,48 @@ export default function App() {
         Angemeldet als <strong>{userName}</strong>
       </div>
 
-      {/* Emergency-Button prominent */}
       <button className="btn-emergency" onClick={() => setView('emergency')}>
         🚨 NOTFALLMODUS
       </button>
 
       <div className="stats-grid">
-        <div className="stat-card stat-must">
+        <button
+          className={`stat-card stat-must ${filter === 'expected' ? 'stat-active' : ''}`}
+          onClick={() => setFilter(filter === 'expected' ? null : 'expected')}
+        >
           <div className="stat-number">{stillExpected}</div>
           <div className="stat-label">müssen da sein</div>
-        </div>
+        </button>
         <div className="stat-card stat-da">
           <div className="stat-number">{counts.da}</div>
           <div className="stat-label">Da ✓</div>
         </div>
-        <div className="stat-card stat-abgeholt">
+        <button
+          className={`stat-card stat-abgeholt ${filter === 'abgeholt' ? 'stat-active' : ''}`}
+          onClick={() => setFilter(filter === 'abgeholt' ? null : 'abgeholt')}
+        >
           <div className="stat-number">{counts.abgeholt}</div>
           <div className="stat-label">Abgeholt</div>
-        </div>
-        <div className="stat-card stat-entsch">
+        </button>
+        <button
+          className={`stat-card stat-entsch ${filter === 'entschuldigt' ? 'stat-active' : ''}`}
+          onClick={() => setFilter(filter === 'entschuldigt' ? null : 'entschuldigt')}
+        >
           <div className="stat-number">{counts.entschuldigt}</div>
           <div className="stat-label">Entsch.</div>
-        </div>
+        </button>
       </div>
+
+      {filter && (
+        <div className="filter-bar">
+          Filter aktiv: <strong>
+            {filter === 'expected' && 'Müssen da sein'}
+            {filter === 'abgeholt' && 'Abgeholt'}
+            {filter === 'entschuldigt' && 'Entschuldigt'}
+          </strong>
+          <button className="btn-mini" onClick={() => setFilter(null)}>✕ Filter aufheben</button>
+        </div>
+      )}
 
       <div className="action-bar">
         <button className="btn-mini" onClick={() => setShowReset(true)}>↺ Reset</button>
@@ -558,24 +677,37 @@ export default function App() {
             <p>Tippe „+ Kind" oder „📋 Import" für eine Liste.</p>
           </div>
         )}
-        {children.map(child => (
-          <div key={child.id} className={`child-row row-${child.status}`}>
-            <div className="child-name-row">
-              <span className={`status-dot dot-${child.status}`} />
-              <span className="child-name">{child.name}</span>
-              <button className="btn-del" onClick={() => setDeleteTarget(child)} aria-label="Löschen">×</button>
+        {children.length > 0 && groupedChildren.length === 0 && (
+          <div className="empty">
+            <p>Keine Kinder mit diesem Filter.</p>
+          </div>
+        )}
+        {groupedChildren.map(group => (
+          <div key={group.klasse} className="class-group">
+            <div className="class-header">
+              <span className="class-name">Klasse {group.klasse}</span>
+              <span className="class-count">{group.items.length}</span>
             </div>
-            <div className="status-buttons">
-              {Object.entries(STATUS_CONFIG).map(([key, cfg]) => (
-                <button
-                  key={key}
-                  className={`status-btn btn-${key} ${child.status === key ? 'active' : ''}`}
-                  onClick={() => handleStatus(child, key)}
-                >
-                  {cfg.label}
-                </button>
-              ))}
-            </div>
+            {group.items.map(child => (
+              <div key={child.id} className={`child-row row-${child.status}`}>
+                <div className="child-name-row">
+                  <span className={`status-dot dot-${child.status}`} />
+                  <span className="child-name">{child.name}</span>
+                  <button className="btn-del" onClick={() => setDeleteTarget(child)} aria-label="Löschen">×</button>
+                </div>
+                <div className="status-buttons">
+                  {Object.entries(STATUS_CONFIG).map(([key, cfg]) => (
+                    <button
+                      key={key}
+                      className={`status-btn btn-${key} ${child.status === key ? 'active' : ''}`}
+                      onClick={() => handleStatus(child, key)}
+                    >
+                      {cfg.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ))}
           </div>
         ))}
       </div>
@@ -584,6 +716,15 @@ export default function App() {
       {showAdd && (
         <Modal onClose={() => setShowAdd(false)}>
           <h2>Kind hinzufügen</h2>
+          <label className="form-label">Klasse</label>
+          <select
+            className="text-input"
+            value={newClass}
+            onChange={e => setNewClass(e.target.value)}
+          >
+            {CLASSES.map(k => <option key={k} value={k}>Klasse {k}</option>)}
+          </select>
+          <label className="form-label">Name</label>
           <input
             className="text-input"
             type="text"
@@ -604,12 +745,19 @@ export default function App() {
       {showImport && (
         <Modal onClose={() => setShowImport(false)}>
           <h2>Mehrere Kinder importieren</h2>
-          <p className="hint">Namen einzeln pro Zeile, oder mit Komma getrennt. Du kannst auch eine CSV-Datei hochladen.</p>
+          <p className="hint">
+            <strong>Format:</strong> Klasse vor dem Namen, eine Zeile pro Kind.<br/>
+            Beispiele:<br/>
+            <code>1a Max Müller</code><br/>
+            <code>1a;Lena Schmidt</code><br/>
+            <code>2b,Luca Fischer</code><br/>
+            Ohne Klassen-Prefix → Klasse {DEFAULT_CLASS}.
+          </p>
           <input type="file" accept=".csv,.txt" onChange={handleFileUpload} className="file-input" />
           <textarea
             className="text-area"
-            rows={8}
-            placeholder={'Max Müller\nLena Schmidt\nLuca Fischer\n…'}
+            rows={10}
+            placeholder={'1a Max Müller\n1a Lena Schmidt\n1b Luca Fischer\n2a Emma Bauer\n…'}
             value={importText}
             onChange={e => setImportText(e.target.value)}
           />
@@ -660,7 +808,7 @@ function CalendarView({ month, setMonth, archived, onPick, onClose, onExport, bu
 
   const first = new Date(month.year, month.month, 1);
   const lastDay = new Date(month.year, month.month + 1, 0).getDate();
-  const firstWeekday = (first.getDay() + 6) % 7; // 0 = Montag
+  const firstWeekday = (first.getDay() + 6) % 7;
 
   const cells = [];
   for (let i = 0; i < firstWeekday; i++) cells.push(null);
@@ -736,6 +884,11 @@ function DayView({ day, data, onBack }) {
     entschuldigt: data.snapshot.filter(c => c.status === 'entschuldigt').length,
   };
   const sorted = sortChildren(data.snapshot);
+  const grouped = CLASSES.map(k => ({
+    klasse: k,
+    items: sorted.filter(c => (c.klasse || DEFAULT_CLASS) === k),
+  })).filter(g => g.items.length > 0);
+
   const logs = [...(data.logs || [])].sort((a, b) => {
     const ta = a.timestamp?.seconds || 0;
     const tb = b.timestamp?.seconds || 0;
@@ -771,13 +924,21 @@ function DayView({ day, data, onBack }) {
 
       <h3 className="day-section">Endstand des Tages</h3>
       <div className="list">
-        {sorted.map((c, i) => (
-          <div key={i} className={`child-row row-${c.status}`}>
-            <div className="child-name-row">
-              <span className={`status-dot dot-${c.status}`} />
-              <span className="child-name">{c.name}</span>
-              <span className="day-status">{STATUS_CONFIG[c.status]?.label}</span>
+        {grouped.map(group => (
+          <div key={group.klasse} className="class-group">
+            <div className="class-header">
+              <span className="class-name">Klasse {group.klasse}</span>
+              <span className="class-count">{group.items.length}</span>
             </div>
+            {group.items.map((c, i) => (
+              <div key={i} className={`child-row row-${c.status}`}>
+                <div className="child-name-row">
+                  <span className={`status-dot dot-${c.status}`} />
+                  <span className="child-name">{c.name}</span>
+                  <span className="day-status">{STATUS_CONFIG[c.status]?.label}</span>
+                </div>
+              </div>
+            ))}
           </div>
         ))}
       </div>
@@ -795,6 +956,8 @@ function DayView({ day, data, onBack }) {
           else if (l.action === 'delete') text = `${l.childName} gelöscht`;
           else if (l.action === 'reset') text = `Alle zurückgesetzt`;
           else if (l.action === 'import') text = `${l.childName} importiert`;
+          else if (l.action === 'emergency') text = `Notfall: ${l.childName} → ${l.toStatus}`;
+          else if (l.action === 'emergency-reset') text = `Notfall-Übung zurückgesetzt`;
           else text = `${l.action} ${l.childName}`;
           return (
             <div key={i} className="log-item">
@@ -809,8 +972,6 @@ function DayView({ day, data, onBack }) {
   );
 }
 
-// ──────────────────────────────────────────────────────────────────────────
-// Generisches Modal
 // ──────────────────────────────────────────────────────────────────────────
 function Modal({ children, onClose }) {
   return (
